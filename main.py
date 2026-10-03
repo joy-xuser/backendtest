@@ -26,7 +26,7 @@ def home():
 def ping():
     return {"status": "pong", "active": True}
 
-# মেটাডাটা পাওয়ার এন্ডপয়েন্ট (টাইটেল, শিল্পী, থাম্বনেইল)
+# একক গানের মেটাডাটা পাওয়ার এন্ডপয়েন্ট
 @app.get("/info")
 def get_info(url: str):
     try:
@@ -37,7 +37,7 @@ def get_info(url: str):
             "--no-warnings",
             url
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if proc.returncode != 0:
             raise HTTPException(status_code=400, detail="Video extraction failed")
         
@@ -51,11 +51,53 @@ def get_info(url: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# সম্পূর্ণ YouTube প্লেলিস্ট ফেচ করার এন্ডপয়েন্ট
+@app.get("/playlist")
+def get_playlist(url: str):
+    try:
+        cmd = [
+            "yt-dlp",
+            "--flat-playlist",
+            "--dump-json",
+            "--no-warnings",
+            url
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise HTTPException(status_code=400, detail="Playlist extraction failed")
+        
+        tracks = []
+        for line in proc.stdout.strip().split("\n"):
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                video_id = item.get("id")
+                if video_id:
+                    tracks.append({
+                        "id": f"yt_{video_id}",
+                        "title": item.get("title", "Unknown Title"),
+                        "artist": item.get("uploader", item.get("channel", "Unknown Artist")),
+                        "duration": "Stream",
+                        "isYoutube": True,
+                        "ytUrl": f"https://www.youtube.com/watch?v={video_id}",
+                        "url": None,
+                        "image": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+                    })
+            except Exception:
+                continue
+
+        if not tracks:
+            raise HTTPException(status_code=404, detail="No tracks found in playlist")
+
+        return {"tracks": tracks, "count": len(tracks)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # বিজ্ঞাপন ছাড়া ডিরেক্ট অডিও স্ট্রিম করার মূল এন্ডপয়েন্ট
 @app.get("/stream")
 async def stream_audio(url: str):
     try:
-        # yt-dlp দিয়ে শুধু সেরা অডিও স্ট্রিম লিংক বের করা
         cmd = [
             "yt-dlp",
             "-f", "bestaudio[ext=m4a]/bestaudio/best",
@@ -63,7 +105,7 @@ async def stream_audio(url: str):
             "--no-playlist",
             url
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if proc.returncode != 0:
             raise HTTPException(status_code=400, detail="Failed to fetch direct audio stream")
         
@@ -71,7 +113,6 @@ async def stream_audio(url: str):
         if not direct_stream_url:
             raise HTTPException(status_code=404, detail="Stream URL not found")
 
-        # ব্যাকএন্ড থেকে সরাসরি অডিও স্ট্রিম পাইপ করা (No Ads, Pure Audio)
         client = httpx.AsyncClient(timeout=60.0)
         req = client.build_request("GET", direct_stream_url)
         res = await client.send(req, stream=True)
