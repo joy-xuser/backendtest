@@ -1,10 +1,9 @@
-import subprocess
-import json
 import urllib.parse
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
+import yt_dlp
 
 app = FastAPI(title="Ad-Free YT Audio Engine")
 
@@ -17,11 +16,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# yt-dlp এর জন্য শক্তিশালী কনফিগারেশন (Android Client দিয়ে ডেটাসেন্টার আইপি ব্লক বাইপাস)
+YDL_AUDIO_OPTS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "extract_flat": False,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"]
+        }
+    }
+}
+
 @app.get("/")
 def home():
-    return {"status": "running", "engine": "FastAPI + yt-dlp"}
+    return {"status": "running", "engine": "FastAPI + yt-dlp (Native)"}
 
-# স্লিপ প্রিভেনশনের জন্য হেলথ চেক এন্ডপয়েন্ট (Cron-job এখানে হিট করবে)
+# স্লিপ প্রিভেনশনের জন্য হেলথ চেক
 @app.get("/ping")
 def ping():
     return {"status": "pong", "active": True}
@@ -30,48 +43,34 @@ def ping():
 @app.get("/info")
 def get_info(url: str):
     try:
-        cmd = [
-            "yt-dlp",
-            "--dump-json",
-            "--no-playlist",
-            "--no-warnings",
-            url
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if proc.returncode != 0:
-            raise HTTPException(status_code=400, detail="Video extraction failed")
-        
-        data = json.loads(proc.stdout)
-        return {
-            "title": data.get("title", "Unknown Title"),
-            "artist": data.get("uploader", data.get("channel", "Unknown Artist")),
-            "duration": data.get("duration", 0),
-            "thumbnail": data.get("thumbnail", "")
-        }
+        with yt_dlp.YoutubeDL(YDL_AUDIO_OPTS) as ydl:
+            data = ydl.extract_info(url, download=False)
+            return {
+                "title": data.get("title", "Unknown Title"),
+                "artist": data.get("uploader", data.get("channel", "Unknown Artist")),
+                "duration": data.get("duration", 0),
+                "thumbnail": data.get("thumbnail", "")
+            }
     except Exception as e:
+        print(f"Info extraction error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # সম্পূর্ণ YouTube প্লেলিস্ট ফেচ করার এন্ডপয়েন্ট
 @app.get("/playlist")
 def get_playlist(url: str):
+    playlist_opts = {
+        "extract_flat": "in_playlist",
+        "quiet": True,
+        "no_warnings": True
+    }
     try:
-        cmd = [
-            "yt-dlp",
-            "--flat-playlist",
-            "--dump-json",
-            "--no-warnings",
-            url
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            raise HTTPException(status_code=400, detail="Playlist extraction failed")
-        
-        tracks = []
-        for line in proc.stdout.strip().split("\n"):
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
+        with yt_dlp.YoutubeDL(playlist_opts) as ydl:
+            data = ydl.extract_info(url, download=False)
+            entries = data.get("entries", [])
+            tracks = []
+            for item in entries:
+                if not item:
+                    continue
                 video_id = item.get("id")
                 if video_id:
                     tracks.append({
@@ -84,37 +83,36 @@ def get_playlist(url: str):
                         "url": None,
                         "image": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
                     })
-            except Exception:
-                continue
 
-        if not tracks:
-            raise HTTPException(status_code=404, detail="No tracks found in playlist")
+            if not tracks:
+                raise HTTPException(status_code=404, detail="No tracks found in playlist")
 
-        return {"tracks": tracks, "count": len(tracks)}
+            return {"tracks": tracks, "count": len(tracks)}
     except Exception as e:
+        print(f"Playlist extraction error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# বিজ্ঞাপন ছাড়া ডিরেক্ট অডিও স্ট্রিম করার মূল এন্ডপয়েন্ট
+# বিজ্ঞাপন ছাড়া ডিরেক্ট অডিও স্ট্রিম করার মূল এন্ডপয়েন্ট (হেডার ম্যাচিংসহ)
 @app.get("/stream")
-async def stream_audio(url: str):
+async def stream_audio(url: str, request: Request):
     try:
-        cmd = [
-            "yt-dlp",
-            "-f", "bestaudio[ext=m4a]/bestaudio/best",
-            "-g",
-            "--no-playlist",
-            url
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if proc.returncode != 0:
-            raise HTTPException(status_code=400, detail="Failed to fetch direct audio stream")
-        
-        direct_stream_url = proc.stdout.strip()
-        if not direct_stream_url:
+        with yt_dlp.YoutubeDL(YDL_AUDIO_OPTS) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            # সরাসরি অডিও স্ট্রিম URL এবং প্রয়োজনীয় হেডার সংগ্রহ
+            stream_url = info.get("url")
+            stream_headers = info.get("http_headers", {})
+
+        if not stream_url:
             raise HTTPException(status_code=404, detail="Stream URL not found")
 
-        client = httpx.AsyncClient(timeout=60.0)
-        req = client.build_request("GET", direct_stream_url)
+        # ব্রাউজারের রেঞ্জ রিকোয়েস্ট পাস করা যাতে অডিও স্কিপ/সিকিং কাজ করে
+        client_range = request.headers.get("range")
+        if client_range:
+            stream_headers["Range"] = client_range
+
+        client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
+        req = client.build_request("GET", stream_url, headers=stream_headers)
         res = await client.send(req, stream=True)
 
         async def audio_generator():
@@ -125,17 +123,24 @@ async def stream_audio(url: str):
                 await res.aclose()
                 await client.aclose()
 
-        headers = {
+        response_headers = {
             "Content-Type": res.headers.get("content-type", "audio/mp4"),
             "Accept-Ranges": "bytes",
             "Cache-Control": "public, max-age=3600"
         }
         if "content-length" in res.headers:
-            headers["Content-Length"] = res.headers["content-length"]
+            response_headers["Content-Length"] = res.headers["content-length"]
+        if "content-range" in res.headers:
+            response_headers["Content-Range"] = res.headers["content-range"]
 
-        return StreamingResponse(audio_generator(), headers=headers)
+        return StreamingResponse(
+            audio_generator(), 
+            status_code=res.status_code, 
+            headers=response_headers
+        )
 
     except Exception as e:
+        print(f"Stream error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
